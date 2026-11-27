@@ -1,7 +1,10 @@
 import json
+import os
 import re
 import time
 from pathlib import Path
+
+os.environ.setdefault("GRADIO_SSR_MODE", "false")
 
 import gradio as gr
 import numpy as np
@@ -228,7 +231,7 @@ def _build_ui() -> gr.Blocks:
     return demo
 
 
-app = gr.mount_gradio_app(app, _build_ui(), path="/ui")
+app = gr.mount_gradio_app(app, _build_ui(), path="/ui", ssr_mode=False)
 
 
 @app.get("/")
@@ -244,4 +247,5 @@ def index():
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(__import__("os").environ.get("PORT", 7860)))
+    port = int(os.environ.get("GRADIO_SERVER_PORT", os.environ.get("PORT", "7860")))
+    uvicorn.run(app, host="0.0.0.0", port=port)
