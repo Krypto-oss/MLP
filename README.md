@@ -3,8 +3,9 @@ title: RAG KB Challenge
 emoji: 🔎
 colorFrom: blue
 colorTo: purple
-sdk: docker
-app_port: 7860
+sdk: gradio
+sdk_version: 5.50.0
+app_file: app.py
 pinned: false
 ---
 
@@ -17,3 +18,4 @@ Dense-retrieval RAG over a 50-passage technical knowledge base.
 - Abstains (null answer, empty sources, confidence < 0.4) on off-topic / unanswerable queries
 - Query-side prompt-injection patterns are stripped; answers are only ever quoted KB text
 - CORS: `Access-Control-Allow-Origin: *`
+- Small Gradio demo UI at `/ui`

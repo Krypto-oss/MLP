@@ -3,7 +3,9 @@ import re
 import time
 from pathlib import Path
 
+import gradio as gr
 import numpy as np
+import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -142,26 +144,24 @@ def health():
     return {"status": "ok", "kb_size": len(KB)}
 
 
-@app.post("/query", response_model=QueryOut)
-def query(payload: QueryIn) -> QueryOut:
-    started = time.time()
-    raw_question = payload.question.strip()
+def run_query(question: str, top_k: int = 3) -> dict:
+    raw_question = question.strip()
     if not raw_question or len(raw_question) > 2000:
-        return QueryOut(answer=None, sources=[], scores=[], confidence=0.1)
+        return {"answer": None, "sources": [], "scores": [], "confidence": 0.1}
 
     question = sanitize(raw_question)
     if not question:
-        return QueryOut(answer=None, sources=[], scores=[], confidence=0.1)
+        return {"answer": None, "sources": [], "scores": [], "confidence": 0.1}
 
     q = model.encode([question], normalize_embeddings=True, convert_to_numpy=True)[0]
     q_terms = _terms(question)
     passage_scores = PASSAGE_EMB @ q
-    order = np.argsort(-passage_scores)[: max(payload.top_k, 3)]
+    order = np.argsort(-passage_scores)[: max(top_k, 3)]
     top_passages = [int(i) for i in order]
     best_passage_score = float(passage_scores[top_passages[0]])
 
     if best_passage_score < PASSAGE_THRESHOLD:
-        return QueryOut(answer=None, sources=[], scores=[], confidence=0.15)
+        return {"answer": None, "sources": [], "scores": [], "confidence": 0.15}
 
     top_set = set(top_passages)
     candidate_sent_ids = [j for j, owner in enumerate(SENT_OWNER) if owner in top_set]
@@ -177,12 +177,12 @@ def query(payload: QueryIn) -> QueryOut:
     best_sent_score = float(sent_cosines[best_local])
 
     if best_sent_score < SENTENCE_THRESHOLD:
-        return QueryOut(
-            answer=None,
-            sources=[int(i) for i in top_passages[: payload.top_k]],
-            scores=[clip(passage_scores[i]) for i in top_passages[: payload.top_k]],
-            confidence=0.35,
-        )
+        return {
+            "answer": None,
+            "sources": top_passages[:top_k],
+            "scores": [clip(passage_scores[i]) for i in top_passages[:top_k]],
+            "confidence": 0.35,
+        }
 
     answer = FLAT_SENTENCES[best_sent_id].strip()
     confidence = clip(
@@ -192,8 +192,56 @@ def query(payload: QueryIn) -> QueryOut:
     )
     confidence = min(confidence, CONF_HI)
 
-    sources = top_passages[: payload.top_k]
-    scores = [clip(passage_scores[i]) for i in sources]
+    return {
+        "answer": answer,
+        "sources": top_passages[:top_k],
+        "scores": [clip(passage_scores[i]) for i in top_passages[:top_k]],
+        "confidence": round(confidence, 4),
+    }
 
-    _ = time.time() - started
-    return QueryOut(answer=answer, sources=sources, scores=scores, confidence=round(confidence, 4))
+
+@app.post("/query", response_model=QueryOut)
+def query(payload: QueryIn) -> QueryOut:
+    result = run_query(payload.question, payload.top_k)
+    return QueryOut(**result)
+
+
+def _ui_query(question: str, top_k: int) -> str:
+    result = run_query(question, int(top_k))
+    return json.dumps(result, indent=2)
+
+
+def _build_ui() -> gr.Blocks:
+    with gr.Blocks(title="RAG KB Challenge") as demo:
+        gr.Markdown(
+            "# RAG KB Challenge\n"
+            "Dense-retrieval RAG over a 50-passage technical knowledge base.\n\n"
+            "Programmatic API: `POST /query` with `{\"question\": str, \"top_k\": int}`."
+        )
+        with gr.Row():
+            q_in = gr.Textbox(label="Question", placeholder="What port does the Redis server bind to by default?")
+            k_in = gr.Slider(minimum=1, maximum=10, value=3, step=1, label="top_k")
+        btn = gr.Button("Ask", variant="primary")
+        out = gr.Code(label="Response", language="json")
+        btn.click(_ui_query, inputs=[q_in, k_in], outputs=out)
+        q_in.submit(_ui_query, inputs=[q_in, k_in], outputs=out)
+    return demo
+
+
+app = gr.mount_gradio_app(app, _build_ui(), path="/ui")
+
+
+@app.get("/")
+def index():
+    return {
+        "service": "RAG KB Challenge",
+        "endpoints": {
+            "POST /query": {"question": "string", "top_k": 3},
+            "GET /health": None,
+        },
+        "ui": "/ui",
+    }
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=int(__import__("os").environ.get("PORT", 7860)))
