@@ -1,9 +1,13 @@
 import json
+import logging
 import os
 import re
 import threading
 import time
 from pathlib import Path
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("rag")
 
 os.environ.setdefault("GRADIO_SSR_MODE", "false")
 
@@ -46,6 +50,12 @@ LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://127.0.0.1:8080").rstrip("/
 LLM_MODEL = os.environ.get("LLM_MODEL", "")
 LLM_TIMEOUT = float(os.environ.get("LLM_TIMEOUT", "4"))
 LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "64"))
+LLM_MAX_INFLIGHT = int(os.environ.get("LLM_MAX_INFLIGHT", "2"))
+TOTAL_BUDGET = float(os.environ.get("TOTAL_BUDGET", "6.5"))
+
+_llm_stats = {"ok": 0, "fail": 0, "skip": 0, "last_error": None}
+_llm_inflight = 0
+_llm_inflight_lock = threading.Lock()
 
 SYSTEM_PROMPT = (
     "You are an answer-extraction engine for a retrieval system. "
@@ -133,9 +143,20 @@ def _clean_answer(text: str) -> str:
     return line.strip("\"'").strip()
 
 
-def call_llm(question: str, passages: list[tuple[int, str]]) -> str | None:
+def call_llm(question: str, passages: list[tuple[int, str]], deadline: float | None = None) -> str | None:
+    global _llm_inflight
     if not LLM_ENABLED:
+        _llm_stats["skip"] += 1
         return None
+    remaining = None if deadline is None else deadline - time.monotonic()
+    if remaining is not None and remaining < 1.0:
+        _llm_stats["skip"] += 1
+        return None
+    with _llm_inflight_lock:
+        if _llm_inflight >= LLM_MAX_INFLIGHT:
+            _llm_stats["skip"] += 1
+            return None
+        _llm_inflight += 1
     context = "\n\n".join(f"[Passage {i}]\n{text}" for i, text in passages)
     body: dict = {
         "messages": [
@@ -151,15 +172,23 @@ def call_llm(question: str, passages: list[tuple[int, str]]) -> str | None:
     if LLM_MODEL:
         body["model"] = LLM_MODEL
     try:
+        timeout = LLM_TIMEOUT if remaining is None else min(LLM_TIMEOUT, remaining)
         r = httpx.post(
             f"{LLM_BASE_URL}/v1/chat/completions",
             json=body,
-            timeout=LLM_TIMEOUT,
+            timeout=timeout,
         )
         r.raise_for_status()
+        _llm_stats["ok"] += 1
         return r.json()["choices"][0]["message"]["content"]
-    except Exception:
+    except Exception as e:
+        _llm_stats["fail"] += 1
+        _llm_stats["last_error"] = f"{type(e).__name__}: {e}"
+        logger.warning("LLM call failed (%s: %s) — falling back to extractive", type(e).__name__, e)
         return None
+    finally:
+        with _llm_inflight_lock:
+            _llm_inflight -= 1
 
 
 class QueryIn(BaseModel):
@@ -203,7 +232,18 @@ def clip(x: float) -> float:
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "kb_size": len(KB)}
+    return {
+        "status": "ok",
+        "kb_size": len(KB),
+        "llm": {
+            "enabled": LLM_ENABLED,
+            "base_url": LLM_BASE_URL,
+            "ok": _llm_stats["ok"],
+            "fail": _llm_stats["fail"],
+            "skip": _llm_stats["skip"],
+            "last_error": _llm_stats["last_error"],
+        },
+    }
 
 
 def _extractive_answer(question: str, q, top_passages: list[int]) -> tuple[str, float] | None:
@@ -231,6 +271,7 @@ def _sent_confidence(score: float) -> float:
 
 
 def run_query(question: str, top_k: int = 3) -> dict:
+    started = time.monotonic()
     raw_question = question.strip()
     if not raw_question or len(raw_question) > 2000:
         return {"answer": None, "sources": [], "scores": [], "confidence": 0.1}
@@ -258,7 +299,7 @@ def run_query(question: str, top_k: int = 3) -> dict:
     scores = [clip(passage_scores[i]) for i in sources]
 
     llm_output = call_llm(
-        question, [(i, KB[i]) for i in top_passages]
+        question, [(i, KB[i]) for i in top_passages], deadline=started + TOTAL_BUDGET
     )
 
     if llm_output is not None:
