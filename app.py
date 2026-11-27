@@ -47,7 +47,7 @@ LEXICAL_WEIGHT = 0.35
 
 LLM_ENABLED = os.environ.get("LLM_ENABLED", "1") == "1"
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://127.0.0.1:8080").rstrip("/")
-LLM_MODEL = os.environ.get("LLM_MODEL", "")
+LLM_MODEL = os.environ.get("LLM_MODEL", "default")
 LLM_TIMEOUT = float(os.environ.get("LLM_TIMEOUT", "4"))
 LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "64"))
 LLM_MAX_INFLIGHT = int(os.environ.get("LLM_MAX_INFLIGHT", "2"))
@@ -169,18 +169,36 @@ def call_llm(question: str, passages: list[tuple[int, str]], deadline: float | N
         "max_tokens": LLM_MAX_TOKENS,
         "temperature": 0.0,
     }
-    if LLM_MODEL:
-        body["model"] = LLM_MODEL
+    body["model"] = LLM_MODEL
+    candidates = [body]
+    no_temp = {k: v for k, v in body.items() if k != "temperature"}
+    if no_temp != body:
+        candidates.append(no_temp)
+    minimal = {"messages": body["messages"], "model": LLM_MODEL}
+    if minimal not in candidates:
+        candidates.append(minimal)
+
     try:
         timeout = LLM_TIMEOUT if remaining is None else min(LLM_TIMEOUT, remaining)
-        r = httpx.post(
-            f"{LLM_BASE_URL}/v1/chat/completions",
-            json=body,
-            timeout=timeout,
-        )
-        r.raise_for_status()
-        _llm_stats["ok"] += 1
-        return r.json()["choices"][0]["message"]["content"]
+        last_error: Exception | None = None
+        for attempt_body in candidates:
+            try:
+                r = httpx.post(
+                    f"{LLM_BASE_URL}/v1/chat/completions",
+                    json=attempt_body,
+                    timeout=timeout,
+                )
+                if r.status_code == 422:
+                    logger.warning("LLM rejected payload (422): %s — retrying simpler body", r.text[:300])
+                    last_error = RuntimeError(f"422: {r.text[:200]}")
+                    continue
+                r.raise_for_status()
+                _llm_stats["ok"] += 1
+                return r.json()["choices"][0]["message"]["content"]
+            except httpx.HTTPStatusError as e:
+                last_error = e
+                break
+        raise last_error if last_error else RuntimeError("LLM call failed")
     except Exception as e:
         _llm_stats["fail"] += 1
         _llm_stats["last_error"] = f"{type(e).__name__}: {e}"
