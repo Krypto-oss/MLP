@@ -48,6 +48,7 @@ LEXICAL_WEIGHT = 0.35
 LLM_ENABLED = os.environ.get("LLM_ENABLED", "1") == "1"
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://127.0.0.1:8080").rstrip("/")
 LLM_MODEL = os.environ.get("LLM_MODEL", "default")
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 LLM_TIMEOUT = float(os.environ.get("LLM_TIMEOUT", "4"))
 LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "64"))
 LLM_MAX_INFLIGHT = int(os.environ.get("LLM_MAX_INFLIGHT", "2"))
@@ -178,6 +179,7 @@ def call_llm(question: str, passages: list[tuple[int, str]], deadline: float | N
     if minimal not in candidates:
         candidates.append(minimal)
 
+    headers = {"Authorization": f"Bearer {LLM_API_KEY}"} if LLM_API_KEY else {}
     try:
         timeout = LLM_TIMEOUT if remaining is None else min(LLM_TIMEOUT, remaining)
         last_error: Exception | None = None
@@ -186,6 +188,7 @@ def call_llm(question: str, passages: list[tuple[int, str]], deadline: float | N
                 r = httpx.post(
                     f"{LLM_BASE_URL}/v1/chat/completions",
                     json=attempt_body,
+                    headers=headers,
                     timeout=timeout,
                 )
                 if r.status_code == 422:
